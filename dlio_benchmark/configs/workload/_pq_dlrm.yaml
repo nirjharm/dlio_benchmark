@@ -1,0 +1,31 @@
+model: 
+  name: dlrm
+
+framework: pytorch
+
+workflow:
+  generate_data: False
+  train: True
+  profiling: True
+
+profiling:
+  profiler: iostat
+  devices: ['nvme3n1']
+
+dataset:
+  data_folder: /users/nmukherj/dlio/widetable_microbench/normal-zipf1_2_data/snappy
+  format: parquet
+  num_files_train: 1
+  num_files_eval: 0
+  num_samples_per_file: 100000
+  record_length: 12115
+
+reader:
+  data_loader: pytorch
+  batch_size: 16
+  sample_shuffle: random
+
+train:
+  epochs: 1
+  total_training_steps: 1000
+  computation_time: 0.00064296

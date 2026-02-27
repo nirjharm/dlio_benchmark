@@ -82,12 +82,55 @@ class DLIOPostProcessor:
             self.iotrace = None
             print(f"WARNING: missing necessary file: {os.path.join(self.outdir, 'iostat.json')}")
 
-        try:
-            with open(os.path.join(self.outdir, 'per_epoch_stats.json'), 'r') as per_epoch_stats_file:
-                self.per_epoch_stats = json.load(per_epoch_stats_file)
-        except: 
-            self.per_epoch_stats = None
-            print(f"WARNING: missing necessary file: {os.path.join(self.outdir, 'per_epoch_stats.json')}")
+        # Try the canonical per_epoch_stats file, otherwise look for per-rank variants
+        per_epoch_path = os.path.join(self.outdir, 'per_epoch_stats.json')
+        if os.path.exists(per_epoch_path):
+            try:
+                with open(per_epoch_path, 'r') as per_epoch_stats_file:
+                    self.per_epoch_stats = json.load(per_epoch_stats_file)
+            except Exception:
+                self.per_epoch_stats = None
+                print(f"WARNING: failed to load: {per_epoch_path}")
+        else:
+            # Look for files like '0_per_epoch_stats.json' produced per-rank
+            candidates = sorted(glob.glob(os.path.join(self.outdir, '*_per_epoch_stats.json')))
+            if len(candidates) == 0:
+                self.per_epoch_stats = None
+                print(f"WARNING: missing necessary file: {per_epoch_path}")
+            elif len(candidates) == 1:
+                try:
+                    with open(candidates[0], 'r') as per_epoch_stats_file:
+                        self.per_epoch_stats = json.load(per_epoch_stats_file)
+                    print(f"INFO: loaded per-epoch stats from {os.path.basename(candidates[0])}")
+                except Exception:
+                    self.per_epoch_stats = None
+                    print(f"WARNING: failed to load: {candidates[0]}")
+            else:
+                # Multiple per-rank per_epoch_stats files found. Attempt a best-effort merge
+                merged = {}
+                for p in candidates:
+                    try:
+                        with open(p, 'r') as fh:
+                            data = json.load(fh)
+                        for epoch_k, epoch_v in data.items():
+                            if epoch_k not in merged:
+                                merged[epoch_k] = epoch_v
+                            else:
+                                # If epoch exists, try to merge phases by extending lists where appropriate
+                                for phase_k, phase_v in epoch_v.items():
+                                    if phase_k not in merged[epoch_k]:
+                                        merged[epoch_k][phase_k] = phase_v
+                                    else:
+                                        # If both are dicts, skip merging; best-effort only
+                                        pass
+                    except Exception:
+                        print(f"WARNING: failed to load per-epoch stats from {p}; skipping")
+                if len(merged) == 0:
+                    self.per_epoch_stats = None
+                    print(f"WARNING: could not load any per-epoch stats from candidates")
+                else:
+                    self.per_epoch_stats = merged
+                    print(f"INFO: merged per-epoch stats from {len(candidates)} files")
 
         # These ones will be loaded in later
         self.load_and_proc_time_files = [os.path.join(self.outdir, f) for f in load_and_proc_time_files]
@@ -189,7 +232,16 @@ class DLIOPostProcessor:
 
         # At this point, we should have one big structure containing overall stats, 
         # as well as all the combined loading and processing times for each phase of training
-        
+
+        # Ensure we have a per_epoch_stats structure to fill in (some short runs
+        # may not produce a full per_epoch_stats.json or some phases may be None)
+        if self.per_epoch_stats is None:
+            self.per_epoch_stats = {epoch: {} for epoch in self.epochs_list}
+        else:
+            for epoch in self.epochs_list:
+                if epoch not in self.per_epoch_stats or not isinstance(self.per_epoch_stats[epoch], dict):
+                    self.per_epoch_stats[epoch] = {}
+
         logging.info(f"Computing overall stats")
 
         # Save the overall stats
@@ -218,6 +270,9 @@ class DLIOPostProcessor:
                 phase_processing_times = epoch_processing_times[phase]
                 phase_sample_latencies = epoch_sample_latencies[phase]
                 phase_sample_bandwidth = epoch_sample_bandwidth[phase]
+                # Ensure the per-epoch/phase dict exists
+                if phase not in self.per_epoch_stats[epoch] or not isinstance(self.per_epoch_stats[epoch][phase], dict):
+                    self.per_epoch_stats[epoch][phase] = {}
 
                 self.per_epoch_stats[epoch][phase]['avg_process_loading_time'] = '{:.2f}'.format(sum(phase_loading_times) / self.comm_size)
                 self.per_epoch_stats[epoch][phase]['avg_process_processing_time'] = '{:.2f}'.format(sum(phase_processing_times) / self.comm_size)
@@ -600,6 +655,10 @@ def main():
                         help="Name of the run")
     orig_args = parser.parse_args()
     args = parser.parse_args()
+
+    # Ensure legacy attributes expected by LoadConfig exist
+    if not hasattr(args, 'log_file'):
+        args.log_file = 'dlio.log'
 
     # figuring out the number of process from the outputs
     args.num_proc = len(glob.glob(args.output_folder + "/*_output.json"))

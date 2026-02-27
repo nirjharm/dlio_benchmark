@@ -1,0 +1,41 @@
+# 8 node run with 4 GPUs per node and TPSIZE=4 and PPSIZE=8
+model:
+  name: megatron_deepspeed
+  type: megatron_deepspeed
+  optimization_groups: [1009254400, 865075200, 793600]
+  model_size: 30102
+  num_layers: 40
+  parallelism: 
+    pipeline: 1
+    tensor: 1
+    zero_stage: 1
+  layer_parameters: [52583936, 209715200]
+
+framework: pytorch
+
+workflow:
+  generate_data: False
+  train: True
+  checkpoint: False
+
+dataset: 
+  data_folder: dataset/megatron-deepspeed_vx/
+  format: vortex
+  num_files_train: 1024
+  num_samples_per_file: 10
+  record_length_bytes: 67000000
+  record_length_bytes_stdev: 0
+  record_length_bytes_resize: 0
+  incremental_write: True
+  
+reader: 
+  data_loader: pytorch
+  batch_size: 10
+  read_threads: 1
+  file_shuffle: seed
+  sample_shuffle: seed
+
+train:
+  epochs: 1
+  computation_time: 0.06 # 2.44 sec per step
+  total_training_steps: 10
