@@ -11,6 +11,7 @@ NSTEP="1000"
 BATCHSIZE="16"
 NPROC="1"
 OUTPUT_DIR=""
+COMPUTE_TIME=""
 
 # Function to display help
 usage() {
@@ -66,6 +67,11 @@ while [[ $# -gt 0 ]]; do
             shift
             shift
             ;;
+            -ct)
+                COMPUTE_TIME="$2"
+                shift
+                shift
+                ;;
         -o)
             OUTPUT_DIR="$2"
             shift
@@ -118,13 +124,22 @@ if [[ -z "$OUTPUT_DIR" ]]; then
     OUTPUT_DIR="outputs/${PREFIX}_${MODEL_NAME}_run"
 fi
 
+# Pass compute time only if provided
+EXTRA_ARGS=""
+if [[ -n "$COMPUTE_TIME" ]]; then
+    EXTRA_ARGS="++workload.train.computation_time=${COMPUTE_TIME}"
+fi
+
 # Run the command
 echo "Running DLIO with workload=${PREFIX}_${MODEL_NAME} (np=${NPROC})"
 echo "Output directory: $OUTPUT_DIR"
+if [[ -n "$COMPUTE_TIME" ]]; then
+    echo "Compute time override: $COMPUTE_TIME"
+fi
 
 VENV_PY="/users/nmukherj/venvs/duckdb/bin/python"
 
-export DFTRACER_ENABLE=1
+export DFTRACER_ENABLE=0
 
 mpirun -np ${NPROC} $VENV_PY -m dlio_benchmark.main \
     workload=${PREFIX}_${MODEL_NAME} \
@@ -133,5 +148,6 @@ mpirun -np ${NPROC} $VENV_PY -m dlio_benchmark.main \
     ++workload.output_dir=${OUTPUT_DIR} \
     ++workload.train.total_training_steps=${NSTEP} \
     ++workload.reader.batch_size=${BATCHSIZE} \
+    ${EXTRA_ARGS} \
     ++hydra.run.dir=${OUTPUT_DIR}
 

@@ -21,6 +21,7 @@ _rg_read_counter = 0
 _rg_total_read_time = 0.0
 _dense_total_time = 0.0
 _sparse_total_time = 0.0
+_missing_warned = set()
 
 def _trace(msg, verbose_only=False):
     """Print trace message. If verbose_only=True, only print when _TRACE_VERBOSE is True."""
@@ -32,6 +33,13 @@ def _trace(msg, verbose_only=False):
 # =============================================================================
 _global_file_cache = {}  # filename -> ParquetFile
 _global_row_group_sizes = {}  # filename -> list of row group sizes
+# Single-entry RG cache (last read)
+_last_rg_cache = {
+    "filename": None,
+    "rg_idx": None,
+    "dense_data": None,
+    "sparse_first": None,
+}
 
 def _get_cached_parquet_file(filename):
     """Get or open a ParquetFile, caching at module level to avoid repeated opens."""
@@ -55,6 +63,7 @@ from dlio_benchmark.reader.feature_config import (
     initialize_feature_selection,
     get_selected_columns,
     get_all_selected_column_names,
+    extract_sparse_first_elements_batch,
     format_sample_for_dlio,
 )
 
@@ -72,7 +81,6 @@ class ParquetReader(FormatReader):
     @dlp.log_init
     def __init__(self, dataset_type, thread_index, epoch):
         super().__init__(dataset_type, thread_index)
-        self._row_group_cache = {}  # filename -> (rg_idx, dense_data, sparse_data)
         self._current_filename = None  # track current active file
         
         # Initialize feature selection (uses config defaults or previously set values)
@@ -107,21 +115,30 @@ class ParquetReader(FormatReader):
             idx_in_rg -= size
             rg_idx += 1
 
-        # load row group if not cached (with column projection)
-        if filename not in self._row_group_cache or self._row_group_cache[filename][0] != rg_idx:
+        global _last_rg_cache
+
+        # load row group if not cached (only last RG across all files is cached)
+        if _last_rg_cache["filename"] != filename or _last_rg_cache["rg_idx"] != rg_idx:
             global _rg_total_read_time, _dense_total_time, _sparse_total_time
             _rg_read_counter += 1
             t1 = time.time()
-            
+
             # Read only selected columns from the row group
-            table = pf.read_row_group(rg_idx, columns=self._all_columns)
+            cols = self._dense_columns + self._sparse_columns
+            table = pf.read_row_group(rg_idx, columns=cols)
             rg_read_time = time.time() - t1
             _rg_total_read_time += rg_read_time
-            
-            # Separate dense and sparse data
+
+            # Separate dense and sparse data with missing-column tolerance
             t2 = time.time()
             dense_data = np.empty((table.num_rows, len(self._dense_columns)), dtype=np.float64)
             for i, col_name in enumerate(self._dense_columns):
+                if col_name not in table.column_names:
+                    if col_name not in _missing_warned:
+                        print(f"[PARQUET_READER] missing dense column '{col_name}' in row group; filling zeros", file=sys.stderr, flush=True)
+                        _missing_warned.add(col_name)
+                    dense_data[:, i] = 0.0
+                    continue
                 col_data = table[col_name]
                 try:
                     dense_data[:, i] = col_data.to_numpy(zero_copy_only=False)
@@ -129,22 +146,37 @@ class ParquetReader(FormatReader):
                     dense_data[:, i] = np.asarray(col_data.to_numpy().tolist())
             dense_time = time.time() - t2
             _dense_total_time += dense_time
-            
-            # For sparse columns - extract full lists via to_pylist()
-            # This is slow (~3s for 298 columns) but necessary for full sparse data
+
+            # Sparse columns: tolerate missing, fill zeros
             t3 = time.time()
-            sparse_data = [table[col_name].to_numpy().tolist() for col_name in self._sparse_columns]
+            sparse_data = []
+            for col_name in self._sparse_columns:
+                if col_name not in table.column_names:
+                    if col_name not in _missing_warned:
+                        print(f"[PARQUET_READER] missing sparse column '{col_name}' in row group; filling zeros", file=sys.stderr, flush=True)
+                        _missing_warned.add(col_name)
+                    sparse_data.append([0] * table.num_rows)
+                    continue
+                sparse_data.append(table[col_name].to_numpy().tolist())
             sparse_time = time.time() - t3
             _sparse_total_time += sparse_time
-            
-            self._row_group_cache[filename] = (rg_idx, dense_data, sparse_data)
+
+            sparse_first = extract_sparse_first_elements_batch(sparse_data)
+
+            _last_rg_cache = {
+                "filename": filename,
+                "rg_idx": rg_idx,
+                "dense_data": dense_data,
+                "sparse_first": sparse_first,
+            }
             _trace(f"RG[{rg_idx}]: read={rg_read_time:.3f}s dense={dense_time:.3f}s sparse={sparse_time:.3f}s | TOTAL: rg={_rg_total_read_time:.2f}s dense={_dense_total_time:.2f}s sparse={_sparse_total_time:.2f}s ({_rg_read_counter} rgs)")
 
-        rg_idx_cached, dense_data, sparse_data = self._row_group_cache[filename]
+        dense_data = _last_rg_cache["dense_data"]
+        sparse_first = _last_rg_cache["sparse_first"]
         
         # Extract the sample
         dense_values = dense_data[idx_in_rg]
-        sparse_values = [sparse_col[idx_in_rg] for sparse_col in sparse_data]
+        sparse_values = sparse_first[idx_in_rg]
         
         # Format for DLIO
         record = format_sample_for_dlio(dense_values, sparse_values)
@@ -171,10 +203,9 @@ class ParquetReader(FormatReader):
     @dlp.log
     def close(self, filename):
         super().close(filename)
-        if filename in self._file_cache:
-            del self._file_cache[filename]
-        if filename in self._row_group_cache:
-            del self._row_group_cache[filename]
+        global _last_rg_cache
+        if _last_rg_cache.get("filename") == filename:
+            _last_rg_cache = {"filename": None, "rg_idx": None, "dense_data": None, "sparse_first": None}
         if self._current_filename == filename:
             self._current_filename = None
 

@@ -183,6 +183,60 @@ def reset_feature_selection():
 _format_call_counter = 0
 _format_total_time = 0.0  # Total time spent in format_sample_for_dlio
 
+
+def _first_element_or_zero(value):
+    """Best-effort extraction of the first element from a sparse value."""
+    if value is None:
+        return 0
+    # Common fast paths
+    if isinstance(value, np.ndarray):
+        return value[0] if value.size else 0
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else 0
+
+    # PyArrow scalars/arrays often expose as_py/tolist
+    if hasattr(value, "as_py"):
+        py_val = value.as_py()
+        if isinstance(py_val, list):
+            return py_val[0] if py_val else 0
+        return py_val if py_val is not None else 0
+    if hasattr(value, "tolist"):
+        lst = value.tolist()
+        if isinstance(lst, list):
+            return lst[0] if lst else 0
+        return lst if lst is not None else 0
+
+    # Fallback for scalars/unknowns
+    return value if np.isscalar(value) else 0
+
+
+def extract_sparse_first_elements_batch(sparse_columns) -> np.ndarray:
+    """
+    Convert a list of sparse columns (each column is a sequence per row) into
+    a dense 2D numpy array of the first element per row/column. Intended to be
+    called once per batch/row group to amortize Python overhead.
+    """
+    if not sparse_columns:
+        return np.empty((0, 0), dtype=np.float64)
+
+    num_rows = len(sparse_columns[0])
+    num_cols = len(sparse_columns)
+    first_elems = np.empty((num_rows, num_cols), dtype=np.float64)
+
+    for col_idx, col in enumerate(sparse_columns):
+        # Fast path: numeric numpy array (no per-row Python work)
+        if isinstance(col, np.ndarray) and col.dtype != object:
+            first_elems[:, col_idx] = np.asarray(col, dtype=np.float64, copy=False)
+            continue
+
+        # General path: object arrays or Python lists of variable-length lists
+        col_iter = col if isinstance(col, list) else np.asarray(col, dtype=object)
+        first_elems[:, col_idx] = [
+            _first_element_or_zero(val) for val in col_iter
+        ]
+
+    return first_elems
+
 def format_sample_for_dlio(dense_values: np.ndarray, sparse_values) -> np.ndarray:
     """
     Format a sample's dense and sparse features into DLIO's expected format.
@@ -204,33 +258,24 @@ def format_sample_for_dlio(dense_values: np.ndarray, sparse_values) -> np.ndarra
     _format_call_counter += 1
     t0 = time.time()
     
-    # Convert dense to float64
-    dense_arr = np.asarray(dense_values, dtype=np.float64)
+    # Convert dense to float64 without copying if already correct
+    dense_arr = np.asarray(dense_values, dtype=np.float64, copy=False)
     
     # Handle sparse values - check if already numpy array (fast path)
     if isinstance(sparse_values, np.ndarray):
-        # Fast path: already extracted first elements as numpy array
-        sparse_arr = sparse_values.astype(np.float64)
+        sparse_arr = np.asarray(sparse_values, dtype=np.float64, copy=False)
     else:
-        # Legacy path: list of sparse lists, extract first element of each
-        print(f"WARNING: format_sample_for_dlio received non-array sparse_values at call {_format_call_counter}. This may be inefficient. Consider updating the reader to extract first elements as a numpy array for better performance.", file=sys.stderr, flush=True)
-        sparse_indices = []
-        for sparse_list in sparse_values:
-            if sparse_list is not None and len(sparse_list) > 0:
-                if hasattr(sparse_list, 'as_py'):
-                    sparse_indices.append(sparse_list.as_py()[0] if len(sparse_list.as_py()) > 0 else 0)
-                elif hasattr(sparse_list, 'tolist'):
-                    lst = sparse_list.tolist()
-                    sparse_indices.append(lst[0] if len(lst) > 0 else 0)
-                elif isinstance(sparse_list, (list, np.ndarray)):
-                    sparse_indices.append(sparse_list[0] if len(sparse_list) > 0 else 0)
-                else:
-                    sparse_indices.append(0)
-            else:
-                sparse_indices.append(0)
-        sparse_arr = np.asarray(sparse_indices, dtype=np.float64)
-    
-    combined = np.concatenate([dense_arr, sparse_arr])
+        # Legacy path: list/tuple of sparse lists; extract first element of each
+        sparse_arr = np.fromiter(
+            (_first_element_or_zero(sv) for sv in sparse_values),
+            dtype=np.float64,
+            count=len(sparse_values),
+        )
+
+    # Preallocate output once instead of concatenate allocating twice
+    combined = np.empty(dense_arr.size + sparse_arr.size, dtype=np.float64)
+    combined[: dense_arr.size] = dense_arr
+    combined[dense_arr.size :] = sparse_arr
     
     elapsed = time.time() - t0
     _format_total_time += elapsed
